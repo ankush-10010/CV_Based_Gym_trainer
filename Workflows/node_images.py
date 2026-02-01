@@ -1,3 +1,5 @@
+#/content/ComfyUI/comfy_extras/nodes_images.py
+
 from __future__ import annotations
 
 import nodes
