@@ -1,10 +1,11 @@
 import os
 import io
+import shutil
 import modal
 
 # --- Constants ---
 CHECKPOINT_DIR = "/root/checkpoints"
-DWPOSE_DIR = f"{CHECKPOINT_DIR}/dwpose"
+DWPOSE_CACHE_DIR = f"{CHECKPOINT_DIR}/dwpose"
 
 # --- 1. Define the Download Function ---
 def download_models():
@@ -12,24 +13,23 @@ def download_models():
     import os
     
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    os.makedirs(DWPOSE_DIR, exist_ok=True)
+    os.makedirs(DWPOSE_CACHE_DIR, exist_ok=True)
     
     print("⬇️ Downloading Florence-2...")
     snapshot_download(repo_id="microsoft/Florence-2-large", local_dir=f"{CHECKPOINT_DIR}/florence2")
 
     print("⬇️ Downloading SAM 2 Checkpoint...")
-    # Using curl/wget to fetch the checkpoint
     os.system(f"wget -P {CHECKPOINT_DIR} https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt")
 
     print("⬇️ Downloading DWPose Models (ONNX)...")
-    # Manually download ONNX files to avoid runtime HF connection issues
-    os.system(f"wget -q -O {DWPOSE_DIR}/yolox_l.onnx https://huggingface.co/yzd-v/DWPose/resolve/main/yolox_l.onnx")
-    os.system(f"wget -q -O {DWPOSE_DIR}/dw-ll_ucoco_384.onnx https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.onnx")
+    # Download to our persistent cache folder
+    os.system(f"wget -q -O {DWPOSE_CACHE_DIR}/yolox_l.onnx https://huggingface.co/yzd-v/DWPose/resolve/main/yolox_l.onnx")
+    os.system(f"wget -q -O {DWPOSE_CACHE_DIR}/dw-ll_ucoco_384.onnx https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.onnx")
 
 # --- 2. Define the Container Image ---
 image = (
     modal.Image.debian_slim()
-    .apt_install("git", "wget", "libgl1", "libglib2.0-0") # libgl1 is crucial for opencv
+    .apt_install("git", "wget", "libgl1", "libglib2.0-0")
     .pip_install(
         "torch", "torchvision",
         "transformers==4.46.3", 
@@ -40,11 +40,10 @@ image = (
         "timm", 
         "einops", 
         "numpy",
-        # DWPose specific stack
-        "dwpose",            # The standalone package (not controlnet_aux)
-        "onnxruntime-gpu",   # Required for DWPose inference
-        "mediapipe",         # Required by dwpose package internally
-        "protobuf",          # Often needed to prevent mediapipe import errors
+        "dwpose",            
+        "onnxruntime-gpu",   
+        "mediapipe",         
+        "protobuf",          
         "scipy",
         "scikit-image",
         "matplotlib",
@@ -63,7 +62,7 @@ app = modal.App("maskedbar-pipeline-full", image=image)
     gpu="A10G", 
     secrets=[modal.Secret.from_name("huggingface-secret")],
     timeout=600,
-    concurrency_limit=1
+    max_containers=1  # FIXED: Renamed from concurrency_limit
 )
 class ImagePipeline:
     @modal.enter()
@@ -75,29 +74,36 @@ class ImagePipeline:
         from sam2.sam2_image_predictor import SAM2ImagePredictor
         
         # Specific Imports for DWPose
-        import huggingface_hub
+        import dwpose
         from dwpose import DwposeDetector
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"🚀 Loading models on {self.device}...")
 
-        # --- A. PATCH HF DOWNLOAD FOR DWPOSE ---
-        # We patch the hub download function to intercept requests for the ONNX files
-        # and serve them from our local pre-downloaded path.
-        global original_hf_download
-        original_hf_download = huggingface_hub.hf_hub_download
-
-        def patched_hf_download(repo_id, filename, **kwargs):
-            if "yolox_l" in filename:
-                print(f"🛡️ Patch: Loading Local YOLOX -> {DWPOSE_DIR}/yolox_l.onnx")
-                return f"{DWPOSE_DIR}/yolox_l.onnx"
-            if "dw-ll_ucoco" in filename:
-                print(f"🛡️ Patch: Loading Local DWPose -> {DWPOSE_DIR}/dw-ll_ucoco_384.onnx")
-                return f"{DWPOSE_DIR}/dw-ll_ucoco_384.onnx"
-            return original_hf_download(repo_id, filename, **kwargs)
-
-        huggingface_hub.hf_hub_download = patched_hf_download
-        print("🛡️ DWPose Monkey-Patch applied.")
+        # --- A. FIX DWPOSE PATHS ---
+        # The dwpose library hardcodes paths inside site-packages. 
+        # We manually copy our cached models to where dwpose expects them.
+        
+        # 1. Find where dwpose is installed
+        dwpose_install_path = os.path.dirname(dwpose.__file__)
+        target_dir = os.path.join(dwpose_install_path, "ckpts/yzd-v/DWPose")
+        
+        # 2. Create the directory structure
+        os.makedirs(target_dir, exist_ok=True)
+        
+        # 3. Copy/Link files from our Cache to the Target
+        # (Using copy is safer than symlink in some container contexts)
+        print(f"🛠️ Injecting DWPose models into: {target_dir}")
+        
+        source_yolo = f"{DWPOSE_CACHE_DIR}/yolox_l.onnx"
+        target_yolo = os.path.join(target_dir, "yolox_l.onnx")
+        if not os.path.exists(target_yolo):
+            shutil.copy(source_yolo, target_yolo)
+            
+        source_dw = f"{DWPOSE_CACHE_DIR}/dw-ll_ucoco_384.onnx"
+        target_dw = os.path.join(target_dir, "dw-ll_ucoco_384.onnx")
+        if not os.path.exists(target_dw):
+            shutil.copy(source_dw, target_dw)
 
         # --- B. Load Florence-2 ---
         florence_path = f"{CHECKPOINT_DIR}/florence2"
@@ -113,10 +119,8 @@ class ImagePipeline:
         self.sam2_predictor = SAM2ImagePredictor(self.sam2_model)
 
         # --- D. Load DWPose ---
-        # The patch ensures this loads from local files without internet check issues
+        # Now it will find the files in the local site-packages folder
         self.dwpose_model = DwposeDetector.from_pretrained_default()
-        # dwpose usually handles .to(device) internally via onnxruntime providers, 
-        # but if the class supports it:
         if hasattr(self.dwpose_model, 'to'):
              self.dwpose_model.to(self.device)
 
@@ -182,46 +186,36 @@ class ImagePipeline:
         # --- STEP 3: DWPose (Skeleton) ---
         print(f"   Step 3: Generating DWPose Skeleton...")
         
-        # FIX: We must match the Colab arguments to get the image output.
-        # image_and_json=True returns a tuple: (out_img, keypoints, source)
         out_img, keypoints, source = self.dwpose_model(
             image,
             include_hand=True,
             include_face=False,
             include_body=True,
-            image_and_json=True,  # Crucial for returning PIL image
+            image_and_json=True,
             detect_resolution=512
         )
         
-        # Ensure we have a PIL image
         if not isinstance(out_img, Image.Image):
-             # Fallback if library changes behavior, though unlikely with fixed install
              out_img = Image.fromarray(out_img)
 
-        # Resize skeleton to match original image exactly
         skeleton_image = out_img.resize((w, h), Image.LANCZOS)
         
         # --- STEP 4: Final Overlay ---
         print(f"   Step 4: Composing Result...")
         
         base_np = np.array(skeleton_image.convert("RGB"))
-        
-        # Define where edges are (from SAM)
         edge_mask = thick_edges > 100
-        
-        # Paint edges White onto the Skeleton background
         base_np[edge_mask] = [255, 255, 255]
         
         final_result = Image.fromarray(base_np)
 
-        # Convert back to bytes
         byte_arr = io.BytesIO()
         final_result.save(byte_arr, format='PNG')
         return byte_arr.getvalue()
 
 # --- 4. Local Entrypoint ---
 @app.local_entrypoint()
-def main(filepath: str = "bench.jpeg", prompt: str = "bench"):
+def main(filepath: str = "bench.jpeg", prompt: str = "rod"):
     if not os.path.exists(filepath):
         print(f"❌ Error: File '{filepath}' not found.")
         return
